@@ -1,0 +1,86 @@
+name: Deploy LitePan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker-compose.yml"
+      - ".github/workflows/deploy-litepan.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "镜像标签（beta / v0.5.6-Beta）"
+        required: false
+        default: "beta"
+
+concurrency:
+  group: litepan-deploy
+  cancel-in-progress: false
+
+jobs:
+  # ── 可选：先校验 compose 文件语法 ─────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config -q
+
+  # ── 部署到服务器 ──────────────────────────────────────────
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production          # 可在 Settings→Environments 加审批
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 覆盖镜像标签（可选）
+        if: inputs.image_tag != ''
+        run: |
+          sed -i "s|ponphil/litepan:.*|ponphil/litepan:${{ inputs.image_tag }}|" docker-compose.yml
+          grep image docker-compose.yml
+
+      - name: 上传 compose 文件到服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "docker-compose.yml"
+          target: "/opt/litepan"
+          overwrite: true
+
+      - name: 远程执行部署
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 10m
+          script: |
+            set -e
+            cd /opt/litepan
+
+            # 首次部署时创建数据目录
+            mkdir -p data strm mounts
+            chmod 755 data strm mounts
+
+            # 拉取镜像并启动
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            # 等待并检查状态
+            sleep 8
+            docker compose ps
+
+            # 健康检查
+            if curl -fsS -o /dev/null http://127.0.0.1:5211; then
+              echo "✅ LitePan 启动成功 → http://$(hostname -I | awk '{print $1}'):5211"
+            else
+              echo "❌ LitePan 端口未响应，最近日志："
+              docker compose logs --tail=50
+              exit 1
+            fi
